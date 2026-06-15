@@ -5,17 +5,27 @@ const fs = require('fs').promises;
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 
-const MEDIA_DIR = path.resolve(process.env.MEDIA_DIR || 'C:\\Media');
+const DRIVES_ARRAY = JSON.parse(
+  process.env.DRIVES || '["C:\\Media"]'
+);
+
+const DRIVES = DRIVES_ARRAY.reduce((acc, drivePath, index) => {
+  acc[`drive_${index}`] = path.resolve(drivePath);
+  return acc;
+}, {});
+
 const DB_PATH = path.join(__dirname, 'cache.db');
 
-fastify.register(require('@fastify/static'), {
-  root: MEDIA_DIR,
-  prefix: '/stream/',
-  acceptRanges: true,
-  decorateReply: false,
-  index: false,
-  list: true
-});
+for (const [driveId, resolvedPath] of Object.entries(DRIVES)) {
+  fastify.register(require('@fastify/static'), {
+    root: resolvedPath,
+    prefix: `/stream/${driveId}/`,
+    acceptRanges: true,
+    decorateReply: false,
+    index: false,
+    list: true
+  });
+}
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -25,6 +35,9 @@ const dbQuery = {
   }),
   get: (sql, params = []) => new Promise((res, rej) => {
     db.get(sql, params, (err, row) => { err ? rej(err) : res(row); });
+  }),
+  all: (sql, params = []) => new Promise((res, rej) => {
+    db.all(sql, params, (err, rows) => { err ? rej(err) : res(rows); });
   })
 };
 
@@ -33,7 +46,8 @@ async function initDB() {
     db.run('PRAGMA journal_mode = WAL');
     db.run(`
       CREATE TABLE IF NOT EXISTS system_cache (
-        id TEXT PRIMARY KEY,
+        drive_id TEXT PRIMARY KEY,
+        root_path TEXT,
         tree_data TEXT,
         folders_count INTEGER,
         updated_at INTEGER
@@ -81,40 +95,44 @@ function countDirectories(nodes) {
 }
 
 async function scanAndSyncCache() {
-  fastify.log.info('Running differential background disk sync...');
-  try {
-    const freshTree = await getDirectoryTree(MEDIA_DIR);
-    const count = countDirectories(freshTree);
+  fastify.log.info('Running background multi-drive disk sync...');
 
-    await dbQuery.run(`
-      INSERT INTO system_cache (id, tree_data, folders_count, updated_at)
-      VALUES ('media_root', ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        tree_data = excluded.tree_data,
-        folders_count = excluded.folders_count,
-        updated_at = excluded.updated_at
-    `, [JSON.stringify(freshTree), count, Date.now()]);
+  for (const [driveId, resolvedPath] of Object.entries(DRIVES)) {
+    try {
+      const freshTree = await getDirectoryTree(resolvedPath);
+      const count = countDirectories(freshTree);
 
-    fastify.log.info(`SQLite Cache successfully updated. Total folders: ${count}`);
-  } catch (err) {
-    fastify.log.error(`Background sync failed: ${err.message}`);
+      await dbQuery.run(`
+        INSERT INTO system_cache (drive_id, root_path, tree_data, folders_count, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(drive_id) DO UPDATE SET
+          root_path = excluded.root_path,
+          tree_data = excluded.tree_data,
+          folders_count = excluded.folders_count,
+          updated_at = excluded.updated_at
+      `, [driveId, resolvedPath, JSON.stringify(freshTree), count, Date.now()]);
+
+      fastify.log.info(`SQLite Cache updated for [${driveId}] -> ${resolvedPath}. Folders: ${count}`);
+    } catch (err) {
+      fastify.log.error(`Background sync failed for [${driveId}] (${resolvedPath}): ${err.message}`);
+    }
   }
 }
 
-function injectStreamUrls(nodes) {
+function injectStreamUrls(nodes, driveId, rootPath) {
   return nodes.map(node => {
     if (node.type === 'file') {
-      const relativePath = path.relative(MEDIA_DIR, node.path);
+      const relativePath = path.relative(rootPath, node.path);
       const cleanUrlPath = relativePath.replace(/\\/g, '/');
 
       return {
         ...node,
-        stream_url: `http://127.0.0.1:3000/stream/${encodeURI(cleanUrlPath)}`
+        stream_url: `http://127.0.0.1:3000/stream/${driveId}/${encodeURI(cleanUrlPath)}`
       };
     } else if (node.type === 'directory' && node.children) {
       return {
         ...node,
-        children: injectStreamUrls(node.children)
+        children: injectStreamUrls(node.children, driveId, rootPath)
       };
     }
     return node;
@@ -123,29 +141,38 @@ function injectStreamUrls(nodes) {
 
 fastify.get('/api/library', async (request, reply) => {
   try {
-    const cachedData = await dbQuery.get("SELECT * FROM system_cache WHERE id = 'media_root'");
+    const cachedRows = await dbQuery.all("SELECT * FROM system_cache");
+    const responseLibrary = [];
 
-    if (!cachedData) {
-      fastify.log.warn('Cache empty! Performing emergency cold filesystem read...');
-      const freshTree = await getDirectoryTree(MEDIA_DIR);
-      const count = countDirectories(freshTree);
-      return {
-        root: MEDIA_DIR,
-        cached: false,
-        folders_count: count,
-        tree: injectStreamUrls(freshTree)
-      };
+    for (const [driveId, resolvedPath] of Object.entries(DRIVES)) {
+      const cacheMatch = cachedRows.find(row => row.drive_id === driveId);
+
+      if (!cacheMatch) {
+        fastify.log.warn(`Cache empty for ${resolvedPath}! Cold filesystem read executed...`);
+        const freshTree = await getDirectoryTree(resolvedPath);
+        const count = countDirectories(freshTree);
+
+        responseLibrary.push({
+          id: driveId,
+          root: resolvedPath,
+          cached: false,
+          folders_count: count,
+          tree: injectStreamUrls(freshTree, driveId, resolvedPath)
+        });
+      } else {
+        const parsedTree = JSON.parse(cacheMatch.tree_data);
+        responseLibrary.push({
+          id: driveId,
+          root: cacheMatch.root_path,
+          cached: true,
+          last_sync: new Date(cacheMatch.updated_at).toISOString(),
+          folders_count: cacheMatch.folders_count,
+          tree: injectStreamUrls(parsedTree, driveId, cacheMatch.root_path)
+        });
+      }
     }
 
-    const parsedTree = JSON.parse(cachedData.tree_data);
-
-    return {
-      root: MEDIA_DIR,
-      cached: true,
-      last_sync: new Date(cachedData.updated_at).toISOString(),
-      folders_count: cachedData.folders_count,
-      tree: injectStreamUrls(parsedTree)
-    };
+    return { drives: responseLibrary };
   } catch (err) {
     reply.status(500).send({ error: `Failed to read cache layer: ${err.message}` });
   }
@@ -153,7 +180,7 @@ fastify.get('/api/library', async (request, reply) => {
 
 fastify.post('/api/sync', async (request, reply) => {
   scanAndSyncCache();
-  return { status: 'Sync triggered' };
+  return { status: 'Multi-drive sync triggered' };
 });
 
 const start = async () => {
@@ -162,7 +189,7 @@ const start = async () => {
     await fastify.listen({ port: 3000, host: '127.0.0.1' });
     await scanAndSyncCache();
     setInterval(scanAndSyncCache, 60 * 1000);
-    fastify.log.info(`Media API Server with Streaming Engine listening on http://127.0.0.1:3000`);
+    fastify.log.info(`Media API Server running with array configurations on http://127.0.0.1:3000`);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
